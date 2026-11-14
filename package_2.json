@@ -1,0 +1,17 @@
+{
+  "name": "afkbotplus",
+  "version": "1.0.0",
+  "description": "Gelişmiş Minecraft AFK botu (mineflayer + Claude)",
+  "main": "bot.js",
+  "private": true,
+  "scripts": {
+    "start": "node bot.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "mineflayer": "latest",
+    "mineflayer-pathfinder": "latest"
+  }
+}
