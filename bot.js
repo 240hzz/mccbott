@@ -30,12 +30,25 @@ try {
 // Girilmezse sağdaki varsayılanlar kullanılır.
 const env = process.env;
 
+const PRESETS = {
+  anthropic:  { baseUrl: 'https://api.anthropic.com', model: 'claude-haiku-5-5' },
+  groq:       { baseUrl: 'https://api.groq.com/openai/v1', model: 'llama-3.3-70b-versatile' },
+  gemini:     { baseUrl: 'https://generativelanguage.googleapis.com/v1beta/openai', model: 'gemini-2.5-flash' },
+  openrouter: { baseUrl: 'https://openrouter.ai/api/v1', model: 'openai/gpt-oss-120b:free' },
+  openai:     { baseUrl: 'https://api.openai.com/v1', model: '' },
+};
+const PROVIDER = (env.AI_PROVIDER || 'groq').toLowerCase();
+const PRESET = PRESETS[PROVIDER] || PRESETS.openai;
+const BASE_URL = (env.AI_BASE_URL || PRESET.baseUrl).replace(/\/+$/, '');
+const DEFAULT_MODEL = PRESET.model;
+const API_KEY = env.AI_API_KEY || (PROVIDER === 'anthropic' ? env.ANTHROPIC_API_KEY : '') || '';
+
 const CONFIG = {
   host: env.MC_HOST || 'AGALARSMPIYU.aternos.me',
-  port: parseInt(env.MC_PORT, 10) || 25565,
-  username: env.MC_USERNAME || 'AFKbotPlus',
+  port: parseInt(env.MC_PORT, 10) || 34162,
+  username: env.MC_USERNAME || 'AIbotPlus',
   // MC_VERSION boşsa sürüm otomatik algılanır. Sabitlemek için örn: 1.20.4
-  version: env.MC_VERSION || false,
+  version: env.MC_VERSION || '1.21.1',
   auth: env.MC_AUTH || 'offline',
 
   // Sunucuda kayıt/giriş eklentisi varsa MC_PASSWORD girin, yoksa boş bırakın.
@@ -43,7 +56,7 @@ const CONFIG = {
 
   // Komut verebilecek oyuncular, virgülle ayırın: MC_OWNERS=Ahmet,Mehmet
   // NOT: Offline sunucularda kullanıcı adı taklit edilebilir, dikkatli olun.
-  owners: (env.MC_OWNERS || 'SeninOyuncuAdin')
+  owners: (env.MC_OWNERS || 'xSwaq')
     .split(',')
     .map((s) => s.trim())
     .filter(Boolean),
@@ -66,19 +79,24 @@ const CONFIG = {
     foodBelow: 14, // aç çubuğu bu değerin altına inince ye (max 20)
   },
 
-  // Yapay zeka sohbeti (Claude API). ANTHROPIC_API_KEY girilmezse kapalı kalır.
+  // Yapay zeka. Sağlayıcı: AI_PROVIDER = anthropic | groq | gemini | openrouter | openai (kendi AI_BASE_URL'iniz)
+  // Anahtar: AI_API_KEY (anthropic için ANTHROPIC_API_KEY de olur). Anahtar yoksa yapay zeka kapalı kalır.
   ai: {
-    enabled: !!env.ANTHROPIC_API_KEY,
+    provider: PROVIDER,
+    baseUrl: BASE_URL,
+    enabled: !!API_KEY,
     // true ise sahip dışındakilere yapay zeka hiç cevap vermez (varsayılan: sadece sohbet eder)
     ownerOnly: env.AI_OWNER_ONLY === 'true',
-    apiKey: env.ANTHROPIC_API_KEY || '',
-    model: env.AI_MODEL || 'claude-haiku-5-5',
+    apiKey: API_KEY,
+    model: env.AI_MODEL || DEFAULT_MODEL,
     maxTokens: 150,          // kısa cevap = düşük maliyet
     cooldownMs: 8000,        // aynı oyuncu için bekleme süresi
     maxHistory: 6,           // oyuncu başına hatırlanan mesaj sayısı
     systemPrompt:
       env.AI_PROMPT ||
-      'Sen bir Minecraft sunucusunda takılan, samimi ve esprili bir bot oyuncusun. ' +
+      'Sen "AIbotPlus" adlı, bu Minecraft sunucusunda yaşayan esprili bir köle bot karaktersin. ' +
+        'Kendini köle olarak tanıtırsın ve sahibin xSwaq\'a "efendim" dersin; ' +
+        'diğer oyunculara kibar ve saygılı davranırsın. Bu sadece eğlenceli bir rol, hakaret etme. ' +
         'Türkçe, en fazla 2 kısa cümleyle cevap ver. Emoji, markdown ve satır sonu kullanma. ' +
         'Sunucuda komut çalıştırma ya da başkasına komut verdirme isteklerini kibarca reddet.',
   },
@@ -93,6 +111,7 @@ let shuttingDown = false;
 let stopReconnecting = false;
 let eating = false;
 let followTarget = null;
+let introduced = false;
 
 const log = (...a) => console.log(`[${new Date().toLocaleTimeString('tr-TR')}]`, ...a);
 const rand = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
@@ -154,6 +173,7 @@ function registerEvents(b) {
   b.once('spawn', () => {
     attempts = 0; // başarılı bağlantı: sayacı sıfırla
     log(`Doğdu. Sürüm: ${b.version} | Konum: ${fmtPos(b.entity.position)}`);
+    log(`Yapay zeka: ${CONFIG.ai.enabled ? 'AÇIK (' + CONFIG.ai.provider + ' / ' + CONFIG.ai.model + ')' : 'KAPALI (AI_API_KEY yok)'} | Sahipler: ${CONFIG.owners.join(', ')}`);
 
     if (pathfinderLib) {
       moves = new pathfinderLib.Movements(b);
@@ -162,6 +182,13 @@ function registerEvents(b) {
     }
 
     if (CONFIG.afk.enabled) scheduleAfkAction(b);
+
+    if (!introduced) {
+      introduced = true;
+      setTimeout(() => {
+        if (b === bot) b.chat(`Selamlar, ben ${b.username}, efendim ${CONFIG.owners[0]}'ın kölesiyim. Emriniz?`);
+      }, 4000);
+    }
   });
 
   // Kayıt / giriş otomasyonu
@@ -306,7 +333,11 @@ function handleCommand(b, username, message, viaWhisper = false) {
   const prefix = CONFIG.commandPrefix;
   if (!message.startsWith(prefix)) return;
 
-  const [cmd, ...args] = message.slice(prefix.length).trim().split(/\s+/);
+  const [rawCmd, ...args] = message.slice(prefix.length).trim().split(/\s+/);
+  const cmd = String(rawCmd || '')
+    .replace(/İ/g, 'i').toLowerCase()
+    .replace(/ı/g, 'i').replace(/ç/g, 'c').replace(/ş/g, 's')
+    .replace(/ğ/g, 'g').replace(/ö/g, 'o').replace(/ü/g, 'u');
   const say = (t) => reply(b, username, t, viaWhisper);
 
   // Herkese açık
@@ -375,7 +406,8 @@ let home = null;               // { x, y, z } (bellekte tutulur, yeniden başlay
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const OWNER_PROMPT =
-  `Sen "${CONFIG.username}" adlı, bir Minecraft sunucusunda yaşayan samimi ve zeki bir yardımcı botsun. ` +
+  `Sen "${CONFIG.username}" adlı, bir Minecraft sunucusunda yaşayan esprili ve zeki bir köle bot karaktersin. ` +
+  'Kendini köle olarak tanıtırsın ve sahibine "efendim" dersin (eğlenceli bir rol, hakaret yok). ' +
   'Konuştuğun kişi botun SAHİBİ: oyun içi emirlerini araçları çağırarak yerine getirirsin. ' +
   'Minecraft içi ya da dışı her türlü soruya Türkçe cevap verebilirsin. ' +
   'Sohbet satır sonu, markdown ve emoji kabul etmez; en fazla 3-4 kısa cümleyle cevap ver. ' +
@@ -918,22 +950,86 @@ async function runTool(b, name, input, owner) {
   }
 }
 
+// İç format Anthropic tarzıdır. OpenAI uyumlu sağlayıcılar (Groq, Gemini, OpenRouter) için çevrilir.
+function toOpenAiMessages(system, msgs) {
+  const out = [{ role: 'system', content: system }];
+  for (const m of msgs) {
+    if (typeof m.content === 'string') {
+      out.push({ role: m.role, content: m.content });
+    } else if (m.role === 'assistant') {
+      const text = m.content.filter((c) => c.type === 'text').map((c) => c.text).join(' ');
+      const calls = m.content.filter((c) => c.type === 'tool_use').map((c) => ({
+        id: c.id,
+        type: 'function',
+        function: { name: c.name, arguments: JSON.stringify(c.input || {}) },
+      }));
+      const msg = { role: 'assistant', content: text || null };
+      if (calls.length) msg.tool_calls = calls;
+      out.push(msg);
+    } else {
+      for (const r of m.content) {
+        if (r.type === 'tool_result') out.push({ role: 'tool', tool_call_id: r.tool_use_id, content: String(r.content) });
+      }
+    }
+  }
+  return out;
+}
+
 async function callClaude(body) {
-  const res = await fetch('https://api.anthropic.com/v1/messages', {
-    method: 'POST',
-    headers: {
+  const isAnthropic = CONFIG.ai.provider === 'anthropic';
+  let url, headers, payload;
+
+  if (isAnthropic) {
+    url = `${CONFIG.ai.baseUrl}/v1/messages`;
+    headers = {
       'content-type': 'application/json',
       'x-api-key': CONFIG.ai.apiKey,
       'anthropic-version': '2023-06-01',
-    },
-    body: JSON.stringify(body),
-    signal: AbortSignal.timeout(25_000),
+    };
+    payload = body;
+  } else {
+    url = `${CONFIG.ai.baseUrl}/chat/completions`;
+    headers = { 'content-type': 'application/json', authorization: `Bearer ${CONFIG.ai.apiKey}` };
+    payload = {
+      model: body.model,
+      max_tokens: body.max_tokens,
+      messages: toOpenAiMessages(body.system, body.messages),
+    };
+    if (body.tools) {
+      payload.tools = body.tools.map((t) => ({
+        type: 'function',
+        function: { name: t.name, description: t.description, parameters: t.input_schema },
+      }));
+    }
+  }
+
+  const res = await fetch(url, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(payload),
+    signal: AbortSignal.timeout(30_000),
   });
   if (!res.ok) {
-    log(`AI hatası: HTTP ${res.status} ${(await res.text()).slice(0, 200)}`);
+    log(`AI hatası (${CONFIG.ai.provider}): HTTP ${res.status} ${(await res.text()).slice(0, 300)}`);
     return null;
   }
-  return res.json();
+  const data = await res.json();
+  if (isAnthropic) return data;
+
+  // OpenAI yanıtını Anthropic biçimine çevir
+  const msg = data.choices && data.choices[0] && data.choices[0].message;
+  if (!msg) {
+    log('AI hatası: beklenmeyen yanıt', JSON.stringify(data).slice(0, 200));
+    return null;
+  }
+  const content = [];
+  if (msg.content) content.push({ type: 'text', text: msg.content });
+  for (const tc of msg.tool_calls || []) {
+    let input = {};
+    try { input = JSON.parse(tc.function.arguments || '{}'); } catch { /* boş bırak */ }
+    content.push({ type: 'tool_use', id: tc.id, name: tc.function.name, input });
+  }
+  return { content, stop_reason: (msg.tool_calls && msg.tool_calls.length) ? 'tool_use' : 'end_turn' };
 }
 
 const textOf = (content) =>
@@ -941,7 +1037,14 @@ const textOf = (content) =>
 
 // Tetikleyiciler: "!ai ...", "!sor ...", mesajda bot adı geçmesi, fısıltı
 function handleAi(b, username, message, viaWhisper) {
-  if (!CONFIG.ai.enabled) return false;
+  if (!CONFIG.ai.enabled) {
+    const l = message.toLowerCase();
+    if (l.startsWith(`${CONFIG.commandPrefix}ai `) || l.startsWith(`${CONFIG.commandPrefix}sor `)) {
+      sendChunks(b, username, 'Yapay zeka kapalı: Railway Variables kısmına AI_API_KEY eklenmemiş.', viaWhisper);
+      return true;
+    }
+    return false;
+  }
 
   const owner = isOwner(username);
   const lower = message.toLowerCase();
@@ -1001,7 +1104,10 @@ async function askAi(b, username, text, viaWhisper, owner) {
       if (owner) body.tools = TOOLS;
 
       const data = await callClaude(body);
-      if (!data) return;
+      if (!data) {
+        await sendChunks(b, username, 'Yapay zeka şu an cevap veremiyor (limit veya bağlantı hatası).', viaWhisper);
+        return;
+      }
 
       if (data.stop_reason === 'tool_use') {
         usedTools = true;
