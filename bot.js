@@ -107,6 +107,7 @@ let bot = null;
 let attempts = 0;
 let reconnectTimer = null;
 let afkTimer = null;
+let stuckTimer = null;
 let shuttingDown = false;
 let stopReconnecting = false;
 let eating = false;
@@ -131,10 +132,22 @@ function createBot() {
     auth: CONFIG.auth,
     hideErrors: false,
     checkTimeoutInterval: 60_000,
+    connectTimeout: 30_000,
   };
   if (CONFIG.version) options.version = CONFIG.version;
 
   bot = mineflayer.createBot(options);
+
+  // Bağlantı sessizce takılırsa (ne giriş ne hata) 45 sn sonra yenile
+  const cur = bot;
+  const loginTimer = setTimeout(() => {
+    if (cur === bot && !cur.entity) {
+      log('Giriş 45 sn içinde tamamlanmadı, bağlantı yenileniyor...');
+      try { cur.end('login-timeout'); } catch { /* yok say */ }
+    }
+  }, 45_000);
+  cur.once('spawn', () => clearTimeout(loginTimer));
+  cur.once('end', () => clearTimeout(loginTimer));
 
   if (pathfinderLib) bot.loadPlugin(pathfinderLib.pathfinder);
 
@@ -160,15 +173,60 @@ function scheduleReconnect() {
 function cleanup() {
   if (afkTimer) clearTimeout(afkTimer);
   afkTimer = null;
+  if (stuckTimer) clearInterval(stuckTimer);
+  stuckTimer = null;
   followTarget = null;
   if (currentTask) currentTask.cancelled = true;
   currentTask = null;
   eating = false;
 }
 
+// ---------- Takılma bekçisi ----------
+// Yürürken 4 sn yerinden kıpırdamazsa zıplayıp yan adım atar ve yolu yeniden hesaplar;
+// 14 sn takılı kalırsa görevi iptal edip sahibine haber verir.
+function startStuckWatchdog(b) {
+  if (!pathfinderLib) return;
+  if (stuckTimer) clearInterval(stuckTimer);
+  let last = null;
+  let stuckSecs = 0;
+
+  stuckTimer = setInterval(() => {
+    if (b !== bot || !b.entity || !b.pathfinder) return;
+    if (!b.pathfinder.isMoving()) { stuckSecs = 0; last = null; return; }
+
+    const p = b.entity.position;
+    if (last && p.distanceTo(last) < 0.3) stuckSecs++;
+    else { stuckSecs = 0; last = p.clone(); }
+
+    if (stuckSecs === 4 || stuckSecs === 8 || stuckSecs === 11) {
+      log(`Takıldı (${stuckSecs} sn), kurtulmaya çalışıyor...`);
+      pushEvent('Bir yerde takıldım, kurtulmaya çalışıyorum');
+      const dir = ['left', 'right', 'back'][rand(0, 2)];
+      b.setControlState('jump', true);
+      b.setControlState(dir, true);
+      setTimeout(() => {
+        b.setControlState('jump', false);
+        b.setControlState(dir, false);
+      }, 600);
+      const g = b.pathfinder.goal;
+      if (g) setTimeout(() => { try { b.pathfinder.setGoal(g, !!followTarget); } catch { /* yok say */ } }, 700);
+    }
+
+    if (stuckSecs >= 14) {
+      stuckSecs = 0;
+      const what = currentTask ? currentTask.name : followTarget ? 'takip' : 'yürüme';
+      log(`Takıldı, iptal: ${what}`);
+      pushEvent(`Takıldım, "${what}" iptal edildi`);
+      stopAll(b);
+      b.chat('Efendim, takıldım, buradan yol bulamıyorum.');
+    }
+  }, 1000);
+}
+
 // ---------- Olaylar ----------
 function registerEvents(b) {
   b.once('login', () => log('Sunucuya giriş yapıldı.'));
+  registerAwareness(b);
 
   b.once('spawn', () => {
     attempts = 0; // başarılı bağlantı: sayacı sıfırla
@@ -177,8 +235,14 @@ function registerEvents(b) {
 
     if (pathfinderLib) {
       moves = new pathfinderLib.Movements(b);
-      moves.canDig = false; // yol bulurken blok kırıp zarar vermesin
+      moves.canDig = false;          // yol bulurken blok kırıp zarar vermesin
+      moves.allowParkour = true;     // 1-2 blokluk boşlukları zıplayarak geç
+      moves.allowSprinting = true;
+      moves.maxDropDown = 4;
+      moves.canOpenDoors = true;
       b.pathfinder.setMovements(moves);
+      b.pathfinder.thinkTimeout = 8000;
+      startStuckWatchdog(b);
     }
 
     if (CONFIG.afk.enabled) scheduleAfkAction(b);
@@ -207,6 +271,12 @@ function registerEvents(b) {
   // Sohbet komutları + yapay zeka
   b.on('chat', (username, message) => {
     if (username === b.username) return;
+    pushEvent(`${username} dedi: ${message.slice(0, 120)}`);
+    if (isOwner(username) && /^(dur|durdur|iptal|stop)[\s!.]*$/i.test(message.trim())) {
+      stopAll(b);
+      b.chat('Durdum.');
+      return;
+    }
     if (handleAi(b, username, message, false)) return;
     handleCommand(b, username, message);
   });
@@ -399,6 +469,7 @@ function handleCommand(b, username, message, viaWhisper = false) {
 const aiHistory = new Map();   // oyuncu -> [{role, content}] (sadece düz metin)
 const aiLastUse = new Map();   // oyuncu -> son kullanım zamanı
 let aiBusy = false;
+let aiRunId = 0;
 let moves = null;              // pathfinder Movements
 let currentTask = null;        // { name, cancelled }
 let home = null;               // { x, y, z } (bellekte tutulur, yeniden başlayınca sıfırlanır)
@@ -416,6 +487,8 @@ const OWNER_PROMPT =
   'sonra devam etmek istersen wait_task kullan. ' +
   'Bir eşyayı sahibe getirmek için: find_container, take_from_container, bring_items_to_player. ' +
   'Blok ve eşya adları İngilizce Minecraft kimlikleridir (iron_ingot, oak_log, diamond_ore...). ' +
+  'Sistem mesajının sonundaki OYUN DURUMU bölümü anlık bilgidir (can, konum, envanter, yakındaki oyuncular/mobs, son olaylar): ' +
+  'soruları buna göre cevapla, "kim ne dedi / ne oldu" gibi sorularda Son olaylar kısmını kullan. ' +
   'Yapamadığın ya da başaramadığın şeyi açıkça söyle, uydurma. ' +
   'Asla "/" ile başlayan sunucu komutu yazma. İşin bitince ne yaptığını tek cümleyle söyle.';
 
@@ -633,14 +706,17 @@ function scanSurroundings(b) {
   out.push(`Oyuncular: ${players.join(', ') || 'yok'}`);
 
   const hostiles = {};
+  const friendly = {};
   let drops = 0;
   for (const e of Object.values(b.entities)) {
     const d = e.position.distanceTo(b.entity.position);
     if (d > 24 || e === b.entity) continue;
     if (e.type === 'hostile') hostiles[e.name] = (hostiles[e.name] || 0) + 1;
+    if (e.type === 'animal' || e.type === 'passive' || e.name === 'villager') friendly[e.name] = (friendly[e.name] || 0) + 1;
     if (e.name === 'item' || e.displayName === 'Item') drops++;
   }
   out.push(`Düşman moblar (24m): ${fmtCounts(hostiles) === 'boş' ? 'yok' : fmtCounts(hostiles)}`);
+  out.push(`Hayvan/köylü (24m): ${fmtCounts(friendly) === 'boş' ? 'yok' : fmtCounts(friendly)}`);
   out.push(`Yerdeki eşya sayısı: ${drops}`);
 
   const R = 8;
@@ -760,12 +836,21 @@ async function runTool(b, name, input, owner) {
       stopAll(b);
       const { x, y, z } = t.position;
       await gotoSafe(b, new goals.GoalNear(x, y, z, 2));
+      {
+        const cur = b.players[input.player]?.entity;
+        const d = cur ? b.entity.position.distanceTo(cur.position) : null;
+        if (d != null && d > 6) return `Hata: yaklaşamadım, aramızda ${Math.round(d)} blok var (yol engelli olabilir).`;
+      }
       return `${input.player} oyuncusunun yanına varıldı.`;
     }
 
     case 'go_to_coords':
       stopAll(b);
       await gotoSafe(b, new goals.GoalNear(input.x, input.y, input.z, 1));
+      {
+        const d = b.entity.position.distanceTo(v3(b, input.x, input.y, input.z));
+        if (d > 4) return `Hata: hedefe varamadım, ${Math.round(d)} blok uzakta kaldım (yol engelli olabilir).`;
+      }
       return `${input.x}, ${input.y}, ${input.z} konumuna varıldı.`;
 
     case 'bring_items_to_player': {
@@ -811,7 +896,7 @@ async function runTool(b, name, input, owner) {
             await gotoSafe(b, new goals.GoalNear(block.position.x, block.position.y, block.position.z, 2), 30_000);
             const target = b.blockAt(block.position);
             if (!target || target.name !== blockName) continue;
-            const tool = moves && moves.bestHarvestTool ? moves.bestHarvestTool(target) : null;
+            const tool = b.pathfinder && b.pathfinder.bestHarvestTool ? b.pathfinder.bestHarvestTool(target) : null;
             if (tool) await b.equip(tool, 'hand');
             await b.dig(target);
             mined++;
@@ -975,6 +1060,37 @@ function toOpenAiMessages(system, msgs) {
   return out;
 }
 
+// Model bulunamazsa sağlayıcının model listesinden uygun birini seç (sadece OpenAI uyumlu sağlayıcılar)
+const triedModels = new Set();
+const SKIP_MODEL = /(whisper|orpheus|tts|guard|safeguard|embed|moderation|audio|speech|image|imagen|veo|lyria|aqa)/i;
+const PREFERRED_MODELS = ['gpt-oss-120b', 'gpt-oss-20b', 'llama-3.3-70b', 'llama-3.1-70b', 'qwen', 'gemini', 'llama-3.1-8b', 'llama'];
+
+async function pickFallbackModel() {
+  try {
+    const res = await fetch(`${CONFIG.ai.baseUrl}/models`, {
+      headers: { authorization: `Bearer ${CONFIG.ai.apiKey}` },
+      signal: AbortSignal.timeout(15_000),
+    });
+    if (!res.ok) {
+      log(`Model listesi alınamadı: HTTP ${res.status}`);
+      return null;
+    }
+    const data = await res.json();
+    const ids = (data.data || [])
+      .map((m) => String(m.id || '').replace(/^models\//, ''))
+      .filter((id) => id && !SKIP_MODEL.test(id) && !triedModels.has(id));
+    log('Kullanılabilir modeller:', ids.join(', ').slice(0, 400));
+    for (const p of PREFERRED_MODELS) {
+      const found = ids.find((id) => id.toLowerCase().includes(p));
+      if (found) return found;
+    }
+    return ids[0] || null;
+  } catch (err) {
+    log('Model listesi hatası:', err.message);
+    return null;
+  }
+}
+
 async function callClaude(body) {
   const isAnthropic = CONFIG.ai.provider === 'anthropic';
   let url, headers, payload;
@@ -1010,7 +1126,18 @@ async function callClaude(body) {
     signal: AbortSignal.timeout(30_000),
   });
   if (!res.ok) {
-    log(`AI hatası (${CONFIG.ai.provider}): HTTP ${res.status} ${(await res.text()).slice(0, 300)}`);
+    const errText = await res.text();
+    log(`AI hatası (${CONFIG.ai.provider}): HTTP ${res.status} ${errText.slice(0, 300)}`);
+    // Model bulunamadı/erişim yok: listeden başka bir model seçip bir kez daha dene
+    if (!isAnthropic && !body._retried && (res.status === 404 || res.status === 400) && /model/i.test(errText)) {
+      triedModels.add(body.model);
+      const alt = await pickFallbackModel();
+      if (alt) {
+        log(`Model değiştirildi: ${body.model} -> ${alt}`);
+        CONFIG.ai.model = alt;
+        return callClaude({ ...body, model: alt, _retried: true });
+      }
+    }
     return null;
   }
   const data = await res.json();
@@ -1074,10 +1201,8 @@ function handleAi(b, username, message, viaWhisper) {
   const now = Date.now();
   const cooldown = owner ? 1500 : CONFIG.ai.cooldownMs;
   if (now - (aiLastUse.get(username) || 0) < cooldown) return true; // sessizce yok say
-  if (aiBusy) {
-    if (owner) sendChunks(b, username, 'Bir önceki işle meşgulüm, bitince yaz ya da "dur" de.', viaWhisper);
-    return true;
-  }
+  // Sahip yeni emir verirse eski AI döngüsü devre dışı kalır (askAi içinde aiRunId ile); diğerleri sırada bekletilmez
+  if (aiBusy && !owner) return true;
 
   aiLastUse.set(username, now);
   askAi(b, username, text.slice(0, 400), viaWhisper, owner);
@@ -1085,11 +1210,17 @@ function handleAi(b, username, message, viaWhisper) {
 }
 
 async function askAi(b, username, text, viaWhisper, owner) {
+  const myRun = ++aiRunId;
+  const superseded = () => myRun !== aiRunId;
   aiBusy = true;
   try {
     const history = aiHistory.get(username) || [];
     const msgs = [...history, { role: 'user', content: `${username}: ${text}` }];
-    const system = owner ? OWNER_PROMPT : CONFIG.ai.systemPrompt + OTHERS_SUFFIX;
+    const baseSystem = owner ? OWNER_PROMPT : CONFIG.ai.systemPrompt + OTHERS_SUFFIX;
+    const ctx = buildContext(b, owner);
+    const system = ctx
+      ? `${baseSystem}\n\nOYUN DURUMU (anlık bilgi; cevaplarında buna dayan, olmayan şeyi uydurma):\n${ctx}`
+      : baseSystem;
 
     let finalText = '';
     let usedTools = false;
@@ -1104,6 +1235,7 @@ async function askAi(b, username, text, viaWhisper, owner) {
       if (owner) body.tools = TOOLS;
 
       const data = await callClaude(body);
+      if (superseded()) return; // sahip yeni bir emir verdi
       if (!data) {
         await sendChunks(b, username, 'Yapay zeka şu an cevap veremiyor (limit veya bağlantı hatası).', viaWhisper);
         return;
@@ -1121,6 +1253,7 @@ async function askAi(b, username, text, viaWhisper, owner) {
             out = `Hata: ${e.message}`;
           }
           log(`Araç: ${block.name} ${JSON.stringify(block.input)} -> ${String(out).slice(0, 150)}`);
+          if (superseded()) return;
           results.push({ type: 'tool_result', tool_use_id: block.id, content: String(out).slice(0, 1500) });
         }
         msgs.push({ role: 'user', content: results });
@@ -1144,7 +1277,7 @@ async function askAi(b, username, text, viaWhisper, owner) {
   } catch (err) {
     log('AI isteği başarısız:', err.message);
   } finally {
-    aiBusy = false;
+    if (myRun === aiRunId) aiBusy = false;
   }
 }
 
@@ -1161,6 +1294,148 @@ async function sendChunks(b, username, text, viaWhisper) {
     else b.chat(part);
     await sleep(1500);
   }
+}
+
+// ---------- Oyun farkındalığı ----------
+const events = [];                 // son olaylar (sohbet, giriş/çıkış, ölüm, hasar...)
+let spawnedAt = 0;
+let lastHealthAlert = 0;
+
+function pushEvent(text) {
+  events.push(`${new Date().toLocaleTimeString('tr-TR')} ${text}`);
+  while (events.length > 20) events.shift();
+}
+
+let notableIds = null;
+function nearbyNotableBlocks(b) {
+  try {
+    if (!notableIds) {
+      notableIds = Object.values(b.registry.blocksByName)
+        .filter((x) => /(chest|barrel|shulker_box|furnace|smoker|crafting_table|_bed$|anvil|enchanting_table|brewing_stand|spawner|lectern)/.test(x.name))
+        .map((x) => x.id);
+    }
+    const found = b.findBlocks({ matching: notableIds, maxDistance: 12, count: 24 });
+    const groups = {};
+    for (const pos of found) {
+      const bl = b.blockAt(pos);
+      if (!bl) continue;
+      (groups[bl.name] = groups[bl.name] || []).push(pos);
+    }
+    const me = b.entity.position;
+    return Object.entries(groups)
+      .map(([name, arr]) => {
+        arr.sort((a, c) => a.distanceTo(me) - c.distanceTo(me));
+        const p0 = arr[0];
+        return `${name} x${arr.length} (en yakın ${p0.x}, ${p0.y}, ${p0.z}, ${Math.round(p0.distanceTo(me))}m)`;
+      })
+      .join('; ');
+  } catch {
+    return '';
+  }
+}
+
+// Her yapay zeka isteğine eklenen anlık oyun durumu
+function buildContext(b, owner) {
+  try {
+    const out = [];
+    const t = b.time;
+    const weather = b.thunderState > 0 ? 'fırtına' : b.isRaining ? 'yağmurlu' : 'açık';
+    out.push(`Zaman: ${t && t.isDay ? 'gündüz' : 'gece'}${t && t.day != null ? ` (gün ${t.day})` : ''}, hava: ${weather}`);
+
+    if (b.entity) {
+      const p = b.entity.position;
+      if (owner) {
+        let biome = '';
+        try {
+          const bl = b.blockAt(p.floored());
+          biome = bl && bl.biome ? bl.biome.name : '';
+        } catch { /* yok say */ }
+        out.push(`Konum: ${fmtPos(p)}${b.game && b.game.dimension ? ` (${b.game.dimension})` : ''}${biome ? `, biyom: ${biome}` : ''}`);
+        out.push(`Can ${Math.round(b.health)}/20, açlık ${b.food}/20, elde: ${b.heldItem ? b.heldItem.name : 'boş'}`);
+        const armor = [5, 6, 7, 8].map((i) => b.inventory.slots[i]).filter(Boolean).map((i) => i.name);
+        out.push(`Zırh: ${armor.join(', ') || 'yok'}`);
+        out.push(`Envanter: ${fmtCounts(countBy(b.inventory.items())).slice(0, 300)}`);
+        out.push(`Görev: ${currentTask ? currentTask.name : 'yok'}, ev: ${home ? `${home.x}, ${home.y}, ${home.z}` : 'yok'}`);
+      }
+
+      const near = [];
+      const hostiles = {};
+      const friendly = {};
+      for (const e of Object.values(b.entities)) {
+        if (e === b.entity || !e.position) continue;
+        const d = e.position.distanceTo(p);
+        if (d > 32) continue;
+        if (e.type === 'player') near.push(`${e.username || e.name} (${Math.round(d)}m)`);
+        else if (e.type === 'hostile') hostiles[e.name] = (hostiles[e.name] || 0) + 1;
+        else if (e.type === 'animal' || e.type === 'passive' || e.name === 'villager') {
+          friendly[e.name] = (friendly[e.name] || 0) + 1;
+        }
+      }
+      out.push(`Yakındaki oyuncular (32m): ${near.join(', ') || 'yok'}`);
+      const h = fmtCounts(hostiles);
+      const f = fmtCounts(friendly);
+      out.push(`Yakındaki düşmanlar: ${h === 'boş' ? 'yok' : h}; hayvan/köylü: ${f === 'boş' ? 'yok' : f}`);
+    }
+
+    if (owner && b.entity) {
+      const nb = nearbyNotableBlocks(b);
+      out.push(`Yakındaki önemli bloklar (12m): ${nb || 'yok'}`);
+      const under = b.blockAt(b.entity.position.offset(0, -1, 0));
+      const hazards = [];
+      if (b.entity.isInWater) hazards.push('suda');
+      const lavaInfo = b.registry.blocksByName.lava;
+      if (lavaInfo && b.findBlock({ matching: lavaInfo.id, maxDistance: 5 })) hazards.push('yakında lav var');
+      out.push(`Altımdaki blok: ${under ? under.name : '?'}${hazards.length ? `; dikkat: ${hazards.join(', ')}` : ''}`);
+    }
+
+    const online = Object.keys(b.players).filter((n) => n !== b.username);
+    out.push(`Sunucudaki oyuncular: ${online.join(', ') || 'yok'}`);
+    if (events.length) out.push(`Son olaylar:\n${events.slice(-12).join('\n')}`);
+    return out.join('\n');
+  } catch {
+    return '';
+  }
+}
+
+function registerAwareness(b) {
+  b.once('spawn', () => { spawnedAt = Date.now(); });
+
+  b.on('playerJoined', (pl) => {
+    if (!pl || pl.username === b.username) return;
+    pushEvent(`${pl.username} sunucuya girdi`);
+    // Sahip girince karşıla (bot ilk açıldığında listedekileri sayma)
+    if (isOwner(pl.username) && Date.now() - spawnedAt > 8000) {
+      setTimeout(() => {
+        if (b === bot) b.chat(`Hoş geldiniz efendim ${pl.username}!`);
+      }, 3000);
+    }
+  });
+  b.on('playerLeft', (pl) => {
+    if (pl && pl.username !== b.username) pushEvent(`${pl.username} sunucudan çıktı`);
+  });
+  b.on('death', () => pushEvent('Ben öldüm'));
+  b.on('rain', () => pushEvent(b.isRaining ? 'Yağmur başladı' : 'Yağmur bitti'));
+  b.on('entityHurt', (entity) => {
+    if (entity === b.entity) pushEvent(`Hasar aldım (can ${Math.round(b.health)}/20)`);
+  });
+
+  // Sunucu mesajları: ölüm/giriş-çıkış gibi sistem satırları
+  b.on('messagestr', (msg) => {
+    const m = String(msg).trim();
+    if (!m || m.length > 140 || m.startsWith('<') || m.startsWith('[+]') || m.startsWith('[-]')) return;
+    if (/(was slain|was shot|was killed|died|fell|drowned|burned|blown up|starved|suffocated|hit the ground|tried to swim|achievement|advancement|challenge|goal)/i.test(m)) {
+      pushEvent(`Sunucu: ${m}`);
+    }
+  });
+
+  // Canım azsa sahibine fısılda (dakikada en fazla bir kez)
+  b.on('health', () => {
+    if (b.health > 0 && b.health <= 6 && Date.now() - lastHealthAlert > 60_000) {
+      lastHealthAlert = Date.now();
+      const o = CONFIG.owners.find((n) => b.players[n]);
+      if (o) b.whisper(o, `Efendim, canım azaldı (${Math.round(b.health)}/20)!`);
+    }
+  });
 }
 
 // ---------- Kapanış ----------
